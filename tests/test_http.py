@@ -2586,3 +2586,63 @@ async def test_export_ndjson_preserves_unicode_line_separators(mode: str) -> Non
                 assert len(exported.rows) == 1
                 assert exported.rows[0]["claim"] == row["claim"]
                 assert exported.next_cursor == "next-page"
+
+
+@MODES
+async def test_wait_for_review_invokes_on_poll_callback(
+    mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = Clock(monkeypatch)
+    calls: list[str] = []
+
+    def sync_poll_callback(review_detail: Any) -> None:
+        calls.append(f"sync:{review_detail.status}")
+
+    async def async_poll_callback(review_detail: Any) -> None:
+        calls.append(f"async:{review_detail.status}")
+
+    responses = [review("RUNNING"), review()]
+
+    with Server(lambda request, index: Reply(body=responses[index])) as server:
+        async with session(mode, server.url) as client:
+            cb = async_poll_callback if mode == "async" else sync_poll_callback
+            result = await call(
+                client,
+                "wait_for_review",
+                ORG,
+                REVIEW,
+                timeout=100,
+                on_poll=cb,
+            )
+            assert (result.status, result.gaps, result.reason) == ("COMPLETED", (), None)
+            prefix = "async" if mode == "async" else "sync"
+            assert calls == [f"{prefix}:RUNNING", f"{prefix}:COMPLETED"]
+        assert len(server.requests) == 2
+        assert clock.delays == [5]
+
+    # Assert async client also works with regular synchronous callbacks returning None
+    if mode == "async":
+        sync_calls: list[str] = []
+        with Server(lambda request, index: Reply(body=responses[index])) as server:
+            async with session("async", server.url) as client:
+                result = await call(
+                    client,
+                    "wait_for_review",
+                    ORG,
+                    REVIEW,
+                    timeout=100,
+                    on_poll=lambda r: sync_calls.append(r.status),
+                )
+                assert result.status == "COMPLETED"
+                assert sync_calls == ["RUNNING", "COMPLETED"]
+
+        # Assert async callback that blocks past the remaining budget returns TIMED_OUT
+        with Server(lambda request, index: Reply(body=review("RUNNING"))) as server:
+            async with session("async", server.url) as client:
+                result = await client.wait_for_review(
+                    ORG,
+                    REVIEW,
+                    timeout=0.2,
+                    on_poll=lambda r: asyncio.sleep(2.0),
+                )
+                assert result.status == "TIMED_OUT"
